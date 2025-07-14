@@ -1,30 +1,155 @@
-# Builder 阶段：编译 nvidia-validator 可执行文件
+ARG GOLANG_VERSION=x.x.x
+
 FROM nvcr.io/nvidia/cuda:12.9.1-base-ubi9 AS builder
 
-ARG GOLANG_VERSION=1.24.3
+# 设置代理
+ENV http_proxy="" \
+    https_proxy="" \
+    all_proxy="" \
+    HTTP_PROXY="" \
+    HTTPS_PROXY="" \
+    ALL_PROXY=""
+
+RUN dnf install -y wget make git gcc
+
+ARG GOLANG_VERSION=0.0.0
+RUN set -eux; \
+    \
+    arch="$(uname -m)"; \
+    case "${arch##*-}" in \
+        x86_64 | amd64) ARCH='amd64' ;; \
+        ppc64el | ppc64le) ARCH='ppc64le' ;; \
+        aarch64 | arm64) ARCH='arm64' ;; \
+        *) echo "unsupported architecture" ; exit 1 ;; \
+    esac; \
+    wget -nv -O - https://storage.googleapis.com/golang/go${GOLANG_VERSION}.linux-${ARCH}.tar.gz \
+    | tar -C /usr/local -xz
+
+ENV GOPATH=/go
+ENV PATH=$GOPATH/bin:/usr/local/go/bin:$PATH
+
+WORKDIR /workspace
+# Copy the Go Modules manifests
+COPY go.mod go.mod
+COPY go.sum go.sum
+COPY vendor vendor
+
+# Copy the go source
+COPY cmd/ cmd/
+COPY api/ api/
+COPY controllers/ controllers/
+COPY internal/ internal/
+
+# Copy Makefile
+COPY Makefile Makefile
+# COPY *.mk .
+COPY multi-arch.mk multi-arch.mk
+COPY native-only.mk native-only.mk
+COPY versions.mk versions.mk
+
+# Build
+ARG VERSION="unknown"
+ARG GIT_COMMIT="unknown"
+RUN make cmds
+
+FROM nvcr.io/nvidia/cuda:12.9.1-base-ubi9 AS kubectl-downloader
+
+# 设置代理
+ENV http_proxy="" \
+    https_proxy="" \
+    all_proxy="" \
+    HTTP_PROXY="" \
+    HTTPS_PROXY="" \
+    ALL_PROXY=""
+
+RUN dnf install -y --allowerasing \
+        curl \
+    && \
+        dnf clean all
+
 WORKDIR /workspace
 
-# 将本地 Go SDK 包复制进镜像
-COPY go1.24.3.linux-amd64.tar.gz /tmp/
+# Install must-gather dependency: `kubectl`
+ARG TARGETARCH
+RUN OS_ARCH=${TARGETARCH/x86_64/amd64} && OS_ARCH=${OS_ARCH/aarch64/arm64} && \
+    curl -LO https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/${OS_ARCH}/kubectl && \
+    chmod +x ./kubectl
 
-RUN dnf install -y wget git gcc make && dnf clean all
+FROM nvcr.io/nvidia/cuda:12.9.1-base-ubi9 AS sample-builder
 
-# 解压 Go SDK
-RUN tar -C /usr/local -xzf /tmp/go1.24.3.linux-amd64.tar.gz
+# 设置代理
+ENV http_proxy="" \
+    https_proxy="" \
+    all_proxy="" \
+    HTTP_PROXY="" \
+    HTTPS_PROXY="" \
+    ALL_PROXY=""
 
-ENV PATH=/usr/local/go/bin:$PATH
-ENV GOPATH=/go
+RUN dnf install -y --allowerasing \
+        cmake \
+        cuda-cudart-devel-12-9 \
+        cuda-nvcc-12-9 \
+        g++ \
+        curl \
+    && \
+    dnf clean all
 
-# 复制源码（包括 cmd/nvidia-validator）
-COPY go.mod go.sum vendor/ ./
-COPY cmd/ cmd/
+WORKDIR /build
 
-# 编译 nvidia-validator
-RUN cd cmd/nvidia-validator && go build -ldflags "-s -w" -o /usr/bin/nvidia-validator
+ARG SAMPLE_NAME=vectorAdd
 
-# Final 阶段：使用最小镜像
-FROM nvcr.io/nvidia/distroless/cc:v3.1.10-dev
+ARG CUDA_SAMPLES_VERSION=v12.9
+RUN curl -L https://codeload.github.com/NVIDIA/cuda-samples/tar.gz/refs/tags/${CUDA_SAMPLES_VERSION} | \
+    tar -xzvf - --strip-components=1 --wildcards */${SAMPLE_NAME}/* --wildcards */Common/* && \
+    cd $(find /build/Samples -iname "${SAMPLE_NAME}") && \
+    cmake . && \
+    make && \
+    cp ${SAMPLE_NAME} /build/${SAMPLE_NAME}
 
-COPY --from=builder /usr/bin/nvidia-validator /usr/bin/nvidia-validator
+# The C/C++ distroless image is used as a base since the CUDA vectorAdd
+# sample application depends on C/C++ libraries.
+# FROM nvcr.io/nvidia/distroless/cc:v3.1.10-dev
+FROM nvcr.io/nvidia/cuda:12.9.1-base-ubi9
 
-ENTRYPOINT ["/usr/bin/nvidia-validator"]
+USER root
+
+RUN dnf install -y ca-certificates && dnf clean all
+
+ENV NVIDIA_VISIBLE_DEVICES=void
+
+ARG VERSION="unknown"
+ARG GIT_COMMIT="unknown"
+
+LABEL io.k8s.display-name="NVIDIA GPU Operator"
+LABEL name="NVIDIA GPU Operator"
+LABEL vendor="NVIDIA"
+LABEL version="${VERSION}"
+LABEL release="N/A"
+LABEL summary="Automate the management and monitoring of NVIDIA GPUs."
+LABEL description="See summary"
+LABEL vsc-ref=${GIT_COMMIT}
+
+WORKDIR /
+COPY --from=builder /workspace/gpu-operator /usr/bin/
+COPY --from=kubectl-downloader /workspace/kubectl /usr/bin/
+COPY --from=builder /workspace/nvidia-validator /usr/bin/
+COPY --from=sample-builder /build/vectorAdd /usr/bin/vectorAdd
+# TODO: Copy the compat libs from the 'sample-builder' image instead.
+# The current 'sample-builder' image does not contain the compat libs in the ARM variant.
+# Once new sample images are published that contain the compat libs, we can update the below.
+COPY --from=builder /usr/local/cuda/compat /usr/local/cuda/compat
+
+COPY assets /opt/gpu-operator/
+COPY manifests /opt/gpu-operator/manifests
+COPY validator/manifests /opt/validator/manifests
+
+COPY hack/must-gather.sh /usr/bin/gather
+
+# Add CRD resource into the image for helm upgrades
+COPY deployments/gpu-operator/crds/nvidia.com_clusterpolicies.yaml /opt/gpu-operator/nvidia.com_clusterpolicies.yaml
+COPY deployments/gpu-operator/crds/nvidia.com_nvidiadrivers.yaml /opt/gpu-operator/nvidia.com_nvidiadrivers.yaml
+COPY deployments/gpu-operator/charts/node-feature-discovery/crds/nfd-api-crds.yaml /opt/gpu-operator/nfd-api-crds.yaml
+
+COPY LICENSE /licenses/
+
+ENTRYPOINT ["/usr/bin/gpu-operator"]
