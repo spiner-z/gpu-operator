@@ -182,6 +182,8 @@ const (
 	genericGPUResourceType = "nvidia.com/gpu"
 	// migGPUResourcePrefix indicates the prefix of the MIG resources exposed by NVIDIA DevicePlugin
 	migGPUResourcePrefix = "nvidia.com/mig-"
+	// renameGPUResourcePrefix indicates the prefix of the renamed GPU resources exposed by NVIDIA DevicePlugin, eg: nvidia.com/v100
+	renameGPUResourcePrefix = "nvidia.com/"
 	// migStrategySingle indicates mixed MIG strategy
 	migStrategySingle = "single"
 	// pluginWorkloadPodSpecPath indicates path to plugin validation pod definition
@@ -1263,6 +1265,10 @@ func (p *Plugin) validateGPUResource() error {
 			return nil
 		}
 
+		if p.availableRenameGPUResourcePrefix(node.Status.Capacity) != "" {
+			return nil
+		}
+
 		log.Infof("GPU resources are not yet discovered by the node, retry: %d", retry)
 		time.Sleep(gpuResourceDiscoveryIntervalSeconds * time.Second)
 	}
@@ -1283,6 +1289,16 @@ func (p *Plugin) availableGenericResourceName(resources corev1.ResourceList) cor
 	for resourceName, quantity := range resources {
 		if strings.HasPrefix(string(resourceName), genericGPUResourceType) && quantity.Value() >= 1 {
 			log.Debugf("Found GPU resource name %s quantity %d", resourceName, quantity.Value())
+			return resourceName
+		}
+	}
+	return ""
+}
+
+func (p *Plugin) availableRenameGPUResourcePrefix(resources corev1.ResourceList) corev1.ResourceName {
+	for resourceName, quantity := range resources {
+		if strings.HasPrefix(string(resourceName), renameGPUResourcePrefix) && quantity.Value() >= 1 {
+			log.Debugf("Found renamed GPU resource name %s quantity %d", resourceName, quantity.Value())
 			return resourceName
 		}
 	}
