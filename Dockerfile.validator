@@ -1,28 +1,28 @@
-# Builder 阶段：从本地 Go 包构建 nvidia-validator
+# Builder 阶段：编译 nvidia-validator 可执行文件
 FROM nvcr.io/nvidia/cuda:12.9.1-base-ubi9 AS builder
 
 ARG GOLANG_VERSION=1.24.3
 WORKDIR /workspace
 
-# 把本地 tar 包拷贝进镜像
+# 将本地 Go SDK 包复制进镜像
 COPY go1.24.3.linux-amd64.tar.gz /tmp/
 
 RUN dnf install -y wget git gcc make && dnf clean all
 
-# 解压 Go SDK 到 /usr/local
+# 解压 Go SDK
 RUN tar -C /usr/local -xzf /tmp/go1.24.3.linux-amd64.tar.gz
 
 ENV PATH=/usr/local/go/bin:$PATH
 ENV GOPATH=/go
 
-# 准备源代码
+# 复制源码（包括 cmd/nvidia-validator）
 COPY go.mod go.sum vendor/ ./
-COPY validator/ validator/
+COPY cmd/ cmd/
 
-# 编译 validator（根据实际 cmd 路径调整）
-RUN cd validator && go build -ldflags "-s -w" -o /usr/bin/nvidia-validator ./cmd/validator
+# 编译 nvidia-validator
+RUN cd cmd/nvidia-validator && go build -ldflags "-s -w" -o /usr/bin/nvidia-validator
 
-# 最终镜像阶段：最小化二进制
+# Final 阶段：使用最小镜像
 FROM nvcr.io/nvidia/distroless/cc:v3.1.10-dev
 
 COPY --from=builder /usr/bin/nvidia-validator /usr/bin/nvidia-validator
